@@ -3369,7 +3369,7 @@ class LiteXSoC(SoC):
         with_dma_synchronizer         = False,
         with_dma_monitor              = False,
         with_dma_status               = False, status_width=32,
-        with_dma_table                = True,
+        with_dma_table                = True, dma_table_depth=256,
         with_msi                      = True, msi_type="msi", msi_width=32, msis=None,
         dma_name_prefix               = None,
         msi_name                      = None,
@@ -3475,6 +3475,7 @@ class LiteXSoC(SoC):
                 with_monitor           = with_dma_monitor,
                 with_status            = with_dma_status, status_width=status_width,
                 with_table             = with_dma_table,
+                table_depth            = dma_table_depth,
                 address_width          = address_width,
                 data_width             = data_width,
             )
@@ -3484,11 +3485,13 @@ class LiteXSoC(SoC):
                 self.msis[f"{name.upper()}_DMA{i}_READER"] = dma.reader.irq
         # Prefix the constants with the instance name so a second add_pcie() does not abort on
         # duplicate constants; keep the legacy unprefixed constants for the default instance.
-        self.add_constant(f"{name}_DMA_CHANNELS",   ndmas)
-        self.add_constant(f"{name}_DMA_ADDR_WIDTH", address_width)
+        self.add_constant(f"{name}_DMA_CHANNELS",    ndmas)
+        self.add_constant(f"{name}_DMA_ADDR_WIDTH",  address_width)
+        self.add_constant(f"{name}_DMA_TABLE_DEPTH", dma_table_depth)
         if name == "pcie":
-            self.add_constant("DMA_CHANNELS",   ndmas)
-            self.add_constant("DMA_ADDR_WIDTH", address_width)
+            self.add_constant("DMA_CHANNELS",    ndmas)
+            self.add_constant("DMA_ADDR_WIDTH",  address_width)
+            self.add_constant("DMA_TABLE_DEPTH", dma_table_depth)
 
         # Map/Connect MSI IRQs.
         if with_msi and auto_map_msi_irqs:
