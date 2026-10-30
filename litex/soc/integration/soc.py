@@ -1601,7 +1601,7 @@ class SoC(LiteXModule):
 
     # Add HyperRAM ---------------------------------------------------------------------------------
     def add_hyperram(self, name="hyperram", pads=None, origin=None, size=None, mode="rwx",
-        region_name=None, number=None, cached=True, linker=False,
+        region_name=None, number=None, cached=True, linker=False, module=None,
         l2_cache_size           = 0,
         l2_cache_reverse        = True,
         l2_cache_full_memory_we = True,
@@ -1631,30 +1631,37 @@ class SoC(LiteXModule):
             region_name = name
         if origin is None:
             origin = self.mem_map.get(region_name, None)
-        if pads is None:
-            pads = self.platform.request(name) if number is None else self.platform.request(name, number)
-
         # Core.
         self.check_if_exists(name)
-        bus_kwargs = (
-            {"bus_standard": "wishbone"} if l2_cache_size else
-            self.bus.get_bus_standard_kwargs(with_axi_id_width=True)
-        )
-        hyperram = HyperRAM(
-            pads         = pads,
-            sys_clk_freq = self.sys_clk_freq,
-            **bus_kwargs,
-            **kwargs,
-        )
+        if module is not None:
+            # Pre-built HyperRAM controller (ex: litex.soc.cores.hyperram.HyperRAMController).
+            hyperram = module
+        else:
+            if pads is None:
+                pads = self.platform.request(name) if number is None else self.platform.request(name, number)
+            bus_kwargs = (
+                {"bus_standard": "wishbone"} if l2_cache_size else
+                self.bus.get_bus_standard_kwargs(with_axi_id_width=True)
+            )
+            hyperram = HyperRAM(
+                pads         = pads,
+                sys_clk_freq = self.sys_clk_freq,
+                **bus_kwargs,
+                **kwargs,
+            )
 
         # Optional L2 Cache.
         bus = hyperram.bus
         if l2_cache_size:
-            bus = wishbone.Interface(data_width=32, address_width=32, addressing="word")
+            bus      = wishbone.Interface(data_width=32, address_width=32, addressing="word")
+            cache_wb = hyperram.bus
+            if isinstance(hyperram.bus, axi.AXIInterface):
+                cache_wb = wishbone.Interface(data_width=hyperram.bus.data_width, address_width=32, addressing="word")
+                self.add_module(name=f"{name}_wb2axi", module=axi.Wishbone2AXI(cache_wb, hyperram.bus))
             cache = wishbone.Cache(
                 cachesize = l2_cache_size//4,
                 master    = bus,
-                slave     = hyperram.bus,
+                slave     = cache_wb,
                 reverse   = l2_cache_reverse,
             )
             if l2_cache_full_memory_we:
@@ -2801,14 +2808,17 @@ class LiteXSoC(SoC):
             endianness  = {True : self.cpu.endianness, False:      "big"}[with_ethmac],
             eth_mtu     = eth_mtu,
         )
+        # PHY's eth_tx/eth_rx clock domains (the core's eth_tx/eth_rx, at any data width: some PHYs
+        # name them differently, ex eth0_tx/eth0_rx).
+        if phy_cd is None:
+            phy_crg = getattr(phy, "crg", phy)
+            eth_tx_clk_name = getattr(getattr(phy_crg, "cd_eth_tx", None), "name", "eth_tx")
+            eth_rx_clk_name = getattr(getattr(phy_crg, "cd_eth_rx", None), "name", "eth_rx")
+        else:
+            eth_tx_clk_name = phy_cd + "_tx"
+            eth_rx_clk_name = phy_cd + "_rx"
         if not with_sys_datapath:
-            # Use PHY's eth_tx/eth_rx clock domains.
-            if phy_cd is None:
-                eth_tx_clk_name = getattr(phy, "crg", phy).cd_eth_tx.name
-                eth_rx_clk_name = getattr(phy, "crg", phy).cd_eth_rx.name
-            else:
-                eth_tx_clk_name = phy_cd + "_tx"
-                eth_rx_clk_name = phy_cd + "_rx"
+            # The core runs in the PHY's RX clock domain (its "sys", user ports included).
             ethcore_cd = {True: "sys", False: eth_rx_clk_name}[with_ethmac]
             ethcore = ClockDomainsRenamer({
                 "eth_tx": eth_tx_clk_name,
@@ -2817,16 +2827,24 @@ class LiteXSoC(SoC):
             })(ethcore)
         else:
             ethcore_cd = "sys"
+            if (eth_tx_clk_name, eth_rx_clk_name) != ("eth_tx", "eth_rx"):
+                ethcore = ClockDomainsRenamer({
+                    "eth_tx": eth_tx_clk_name,
+                    "eth_rx": eth_rx_clk_name,
+                })(ethcore)
         ethcore.cd = ethcore_cd
         self.add_module(name=f"ethcore_{name}", module=ethcore)
 
-        etherbone_cd = "sys"
-        if not with_sys_datapath:
-            # Create Etherbone clock domain and run it from sys clock domain.
-            etherbone_cd = name
-            setattr(self, f"cd_{name}", ClockDomain(name))
-            self.comb += getattr(self, f"cd_{name}").clk.eq(ClockSignal("sys"))
-            self.comb += getattr(self, f"cd_{name}").rst.eq(ResetSignal("sys"))
+        # Etherbone clock domain: the sys clock under its own name, so that it is not renamed with
+        # the core. UDP user ports for the SoC's sys clock domain use cd=name at any data width
+        # (ex ethcore.udp.crossbar.get_port(port, dw, cd="etherbone")); cd="sys" is the core's own
+        # clock domain (the PHY's RX clock domain at data_width=8).
+        setattr(self, f"cd_{name}", ClockDomain(name))
+        self.comb += getattr(self, f"cd_{name}").clk.eq(ClockSignal("sys"))
+        self.comb += getattr(self, f"cd_{name}").rst.eq(ResetSignal("sys"))
+        etherbone_cd = name if not with_sys_datapath else "sys"
+        self.logger.info("Etherbone {}-bit core in {} clock domain, UDP user ports for sys: cd=\"{}\".".format(
+            colorer(data_width), colorer(ethcore_cd), colorer(name)))
 
         # Etherbone
         self.check_if_exists(name)
@@ -3369,7 +3387,7 @@ class LiteXSoC(SoC):
         with_dma_synchronizer         = False,
         with_dma_monitor              = False,
         with_dma_status               = False, status_width=32,
-        with_dma_table                = True,
+        with_dma_table                = True, dma_table_depth=256,
         with_msi                      = True, msi_type="msi", msi_width=32, msis=None,
         dma_name_prefix               = None,
         msi_name                      = None,
@@ -3475,6 +3493,7 @@ class LiteXSoC(SoC):
                 with_monitor           = with_dma_monitor,
                 with_status            = with_dma_status, status_width=status_width,
                 with_table             = with_dma_table,
+                table_depth            = dma_table_depth,
                 address_width          = address_width,
                 data_width             = data_width,
             )
@@ -3484,11 +3503,13 @@ class LiteXSoC(SoC):
                 self.msis[f"{name.upper()}_DMA{i}_READER"] = dma.reader.irq
         # Prefix the constants with the instance name so a second add_pcie() does not abort on
         # duplicate constants; keep the legacy unprefixed constants for the default instance.
-        self.add_constant(f"{name}_DMA_CHANNELS",   ndmas)
-        self.add_constant(f"{name}_DMA_ADDR_WIDTH", address_width)
+        self.add_constant(f"{name}_DMA_CHANNELS",    ndmas)
+        self.add_constant(f"{name}_DMA_ADDR_WIDTH",  address_width)
+        self.add_constant(f"{name}_DMA_TABLE_DEPTH", dma_table_depth)
         if name == "pcie":
-            self.add_constant("DMA_CHANNELS",   ndmas)
-            self.add_constant("DMA_ADDR_WIDTH", address_width)
+            self.add_constant("DMA_CHANNELS",    ndmas)
+            self.add_constant("DMA_ADDR_WIDTH",  address_width)
+            self.add_constant("DMA_TABLE_DEPTH", dma_table_depth)
 
         # Map/Connect MSI IRQs.
         if with_msi and auto_map_msi_irqs:
